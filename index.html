@@ -6,30 +6,42 @@ import {
   Vibration,
   PanResponder,
   Platform,
+  TouchableOpacity,
 } from 'react-native';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
+import { Audio } from 'expo-av';
 
 const WS_URL = 'wss://sensex-backend.onrender.com/ws/haptics';
+const BACKEND_URL = 'https://sensex-backend.onrender.com';
 
 export default function App() {
   const [status, setStatus] = useState('Connecting...');
   const [lastAction, setLastAction] = useState('');
+  const [recording, setRecording] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
   const ws = useRef(null);
   const reconnectTimer = useRef(null);
 
   useEffect(() => {
     connectWebSocket();
+    requestMicPermission();
     return () => {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       ws.current?.close();
     };
   }, []);
 
+  const requestMicPermission = async () => {
+    const { granted } = await Audio.requestPermissionsAsync();
+    if (!granted) {
+      alert('Microphone permission is required.');
+    }
+  };
+
   const connectWebSocket = () => {
-    // Close any existing connection before opening a new one
     if (ws.current) {
-      ws.current.onclose = null; // prevent auto-reconnect loop
+      ws.current.onclose = null;
       ws.current.close();
     }
 
@@ -38,7 +50,6 @@ export default function App() {
 
     socket.onopen = () => {
       setStatus('Connected');
-      // Start heartbeat ping every 25s to keep Render connection alive
       const ping = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send('ping');
@@ -48,12 +59,12 @@ export default function App() {
     };
 
     socket.onmessage = (e) => {
-      if (e.data === 'pong') return; // heartbeat reply, ignore
-
+      if (e.data === 'pong') return;
       try {
         const data = JSON.parse(e.data);
         if (data.type === 'VIBRATE') {
           triggerHaptic(data.pattern);
+          if (data.text) setLastAction(data.text);
         }
       } catch (err) {
         console.warn('WS message parse error:', err);
@@ -71,14 +82,75 @@ export default function App() {
     };
   };
 
-  // Cross-platform haptic feedback
   const triggerHaptic = (pattern) => {
     if (Platform.OS === 'ios') {
-      // expo-haptics works on iOS; pattern drives intensity
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     } else {
-      // Android supports Vibration.vibrate with pattern arrays
       Vibration.vibrate(pattern);
+    }
+  };
+
+  const startRecording = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+
+      setRecording(recording);
+      setIsRecording(true);
+      setLastAction('Listening...');
+    } catch (err) {
+      console.error('Failed to start recording:', err);
+    }
+  };
+
+  const stopRecording = async () => {
+    try {
+      setIsRecording(false);
+      setLastAction('Sending...');
+
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      setRecording(null);
+
+      await sendAudioToBackend(uri);
+    } catch (err) {
+      console.error('Failed to stop recording:', err);
+      setLastAction('Error — try again');
+    }
+  };
+
+  const sendAudioToBackend = async (uri) => {
+    try {
+      const formData = new FormData();
+      formData.append('file', {
+        uri,
+        name: 'audio.m4a',
+        type: 'audio/m4a',
+      });
+
+      const response = await fetch(`${BACKEND_URL}/translate-speech`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      });
+
+      const data = await response.json();
+      if (data.status === 'success') {
+        setLastAction(data.text);
+      } else {
+        setLastAction('Not recognized');
+      }
+    } catch (err) {
+      console.error('Failed to send audio:', err);
+      setLastAction('Upload failed');
     }
   };
 
@@ -99,23 +171,15 @@ export default function App() {
   });
 
   const handleAction = (message, confirmPattern, displayLabel) => {
-    // 1. Speak aloud for people around the user
     Speech.speak(message, { language: 'en' });
-
-    // 2. Haptic confirmation so the user knows it fired
     triggerHaptic(confirmPattern);
-
-    // 3. Update UI label
     setLastAction(displayLabel);
-
-    // 4. Send to backend over WebSocket
     if (ws.current?.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify({ action: message }));
     }
   };
 
-  const statusColor =
-    status === 'Connected' ? '#00ff88' : '#ff4d4d';
+  const statusColor = status === 'Connected' ? '#00ff88' : '#ff4d4d';
 
   return (
     <View style={styles.container} {...panResponder.panHandlers}>
@@ -127,10 +191,23 @@ export default function App() {
         </Text>
       </View>
 
-      {/* Last fired action */}
+      {/* Last fired action / transcription */}
       {lastAction ? (
         <Text style={styles.lastAction}>{lastAction}</Text>
       ) : null}
+
+      {/* Mic button */}
+      <TouchableOpacity
+        style={[styles.micButton, isRecording && styles.micButtonActive]}
+        onPressIn={startRecording}
+        onPressOut={stopRecording}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.micIcon}>{isRecording ? '⏹' : '🎤'}</Text>
+        <Text style={styles.micLabel}>
+          {isRecording ? 'Release to send' : 'Hold to speak'}
+        </Text>
+      </TouchableOpacity>
 
       {/* Gesture instructions */}
       <View style={styles.instructions}>
@@ -181,7 +258,33 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 2,
   },
+  micButton: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: '#111',
+    borderWidth: 1.5,
+    borderColor: '#333',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 60,
+  },
+  micButtonActive: {
+    backgroundColor: '#1a0000',
+    borderColor: '#ff4d4d',
+  },
+  micIcon: {
+    fontSize: 40,
+    marginBottom: 8,
+  },
+  micLabel: {
+    color: '#444',
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+  },
   instructions: {
+    position: 'absolute',
+    bottom: 60,
     gap: 18,
     alignItems: 'flex-start',
   },
