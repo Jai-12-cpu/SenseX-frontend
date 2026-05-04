@@ -1,605 +1,641 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   View,
   Text,
   Vibration,
-  PanResponder,
   Platform,
   TouchableOpacity,
+  ScrollView,
+  SafeAreaView,
   Dimensions,
+  ActivityIndicator,
 } from 'react-native';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { Audio } from 'expo-av';
-import { Svg, Path } from 'react-native-svg';
 
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const WS_URL = 'wss://sensex-backend.onrender.com/ws/haptics';
 const BACKEND_URL = 'https://sensex-backend.onrender.com';
-const { width, height } = Dimensions.get('window');
+const RECONNECT_DELAY = 3000;
+const PING_INTERVAL = 25000;
 
-// Simple stroke-based letter recognition
-// Maps drawn strokes to letters using direction analysis
-function recognizeLetter(strokes) {
-  if (!strokes || strokes.length === 0) return '?';
+// ─── KEYBOARD LAYOUT ─────────────────────────────────────────────────────────
+const KEYBOARD_ROWS = [
+  ['Q','W','E','R','T','Y','U','I','O','P'],
+  ['A','S','D','F','G','H','J','K','L'],
+  ['Z','X','C','V','B','N','M'],
+];
 
-  const allPoints = strokes.flat();
-  if (allPoints.length < 2) return '?';
+const QUICK_PHRASES = [
+  { label: 'Yes', pattern: [100] },
+  { label: 'No', pattern: [300] },
+  { label: 'Help', pattern: [500, 200, 500] },
+  { label: 'Thanks', pattern: [100, 100, 100] },
+  { label: 'Wait', pattern: [200, 100, 200] },
+  { label: 'Repeat', pattern: [100, 100, 300] },
+];
 
-  const xs = allPoints.map(p => p.x);
-  const ys = allPoints.map(p => p.y);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const w = maxX - minX;
-  const h = maxY - minY;
+const { width } = Dimensions.get('window');
 
-  // Analyze stroke directions
-  const directions = [];
-  for (const stroke of strokes) {
-    if (stroke.length < 2) continue;
-    const first = stroke[0];
-    const last = stroke[stroke.length - 1];
-    const dx = last.x - first.x;
-    const dy = last.y - first.y;
-    const angle = Math.atan2(dy, dx) * (180 / Math.PI);
-
-    if (Math.abs(dx) < 20 && dy > 30) directions.push('down');
-    else if (Math.abs(dx) < 20 && dy < -30) directions.push('up');
-    else if (Math.abs(dy) < 20 && dx > 30) directions.push('right');
-    else if (Math.abs(dy) < 20 && dx < -30) directions.push('left');
-    else if (dx > 20 && dy > 20) directions.push('down-right');
-    else if (dx < -20 && dy > 20) directions.push('down-left');
-    else if (dx > 20 && dy < -20) directions.push('up-right');
-    else if (dx < -20 && dy < -20) directions.push('up-left');
-    else directions.push('diagonal');
-  }
-
-  const strokeCount = strokes.length;
-  const dir = directions.join(',');
-  const aspect = w / (h || 1);
-
-  // Pattern matching for common letters
-  if (strokeCount === 1) {
-    if (dir.includes('down') && !dir.includes('right') && !dir.includes('left')) return 'I';
-    if (dir.includes('right') && !dir.includes('down') && !dir.includes('up')) return 'L';
-    if (dir.includes('down-right')) return 'J';
-    if (dir.includes('up-right')) return 'V';
-    if (dir.includes('diagonal')) {
-      if (aspect > 1.5) return 'Z';
-      return 'S';
-    }
-    if (dir.includes('down') && dir.includes('right')) return 'C';
-    return 'O';
-  }
-
-  if (strokeCount === 2) {
-    if (directions[0] === 'down' && directions[1] === 'right') return 'L';
-    if (directions[0] === 'down' && directions[1] === 'down') return 'U';
-    if (directions[0] === 'right' && directions[1] === 'down') return 'T';
-    if (directions[0] === 'down-right' && directions[1] === 'down-left') return 'V';
-    if (directions[0] === 'up-right' && directions[1] === 'down-right') return 'K';
-    if (directions[0] === 'down' && directions[1] === 'right') return 'F';
-    if (directions[0] === 'diagonal' && directions[1] === 'diagonal') return 'X';
-    return 'N';
-  }
-
-  if (strokeCount === 3) {
-    if (directions.includes('down') && directions.includes('right')) return 'E';
-    if (directions.includes('up-right') && directions.includes('down-right')) return 'Y';
-    return 'F';
-  }
-
-  return 'A';
-}
-
-export default function App() {
-  const [status, setStatus] = useState('Connecting...');
-  const [recording, setRecording] = useState(null);
+// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
+export default function SensEx() {
+  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [mode, setMode] = useState<'listen' | 'type'>('listen');
   const [isRecording, setIsRecording] = useState(false);
-  const [mode, setMode] = useState('listen'); // 'listen' or 'draw'
-  const [currentWord, setCurrentWord] = useState('');
-  const [currentLetter, setCurrentLetter] = useState('');
-  const [strokes, setStrokes] = useState([]);
-  const [currentStroke, setCurrentStroke] = useState([]);
-  const [paths, setPaths] = useState([]);
-  const [currentPath, setCurrentPath] = useState('');
+  const [isSending, setIsSending] = useState(false);
   const [transcribedText, setTranscribedText] = useState('');
+  const [typedWord, setTypedWord] = useState('');
+  const [lastAction, setLastAction] = useState('');
 
-  const ws = useRef(null);
-  const reconnectTimer = useRef(null);
-  const recognizeTimer = useRef(null);
+  const ws = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const isConnecting = useRef(false);
 
-  useEffect(() => {
-    connectWebSocket();
-    requestMicPermission();
-    return () => {
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (recognizeTimer.current) clearTimeout(recognizeTimer.current);
-      ws.current?.close();
-    };
-  }, []);
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  const connectWS = useCallback(() => {
+    if (isConnecting.current) return;
+    isConnecting.current = true;
 
-  const requestMicPermission = async () => {
-    const { granted } = await Audio.requestPermissionsAsync();
-    if (!granted) alert('Microphone permission is required.');
-  };
-
-  const connectWebSocket = () => {
     if (ws.current) {
       ws.current.onclose = null;
-      ws.current.close();
+      ws.current.onerror = null;
+      try { ws.current.close(); } catch {}
     }
+
+    setWsStatus('connecting');
     const socket = new WebSocket(WS_URL);
-    ws.current = socket;
 
     socket.onopen = () => {
-      setStatus('Connected');
-      const ping = setInterval(() => {
+      isConnecting.current = false;
+      setWsStatus('connected');
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      pingTimer.current = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) socket.send('ping');
-      }, 25000);
-      socket._pingInterval = ping;
+      }, PING_INTERVAL);
     };
 
     socket.onmessage = (e) => {
       if (e.data === 'pong') return;
       try {
         const data = JSON.parse(e.data);
-        if (data.type === 'VIBRATE') {
-          triggerHaptic(data.pattern);
+        if (data.type === 'VIBRATE' && data.pattern) {
+          fireVibration(data.pattern);
           if (data.text) setTranscribedText(data.text);
         }
-      } catch (err) {
-        console.warn('WS parse error:', err);
-      }
+      } catch {}
     };
 
     socket.onclose = () => {
-      clearInterval(socket._pingInterval);
-      setStatus('Disconnected — reconnecting...');
-      reconnectTimer.current = setTimeout(connectWebSocket, 3000);
+      isConnecting.current = false;
+      if (pingTimer.current) clearInterval(pingTimer.current);
+      setWsStatus('disconnected');
+      reconnectTimer.current = setTimeout(connectWS, RECONNECT_DELAY);
     };
 
-    socket.onerror = (err) => console.warn('WS error:', err.message);
+    socket.onerror = () => {
+      isConnecting.current = false;
+      socket.close();
+    };
+
+    ws.current = socket;
+  }, []);
+
+  useEffect(() => {
+    requestPermissions();
+    connectWS();
+    return () => {
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (pingTimer.current) clearInterval(pingTimer.current);
+      if (ws.current) {
+        ws.current.onclose = null;
+        ws.current.close();
+      }
+    };
+  }, [connectWS]);
+
+  // ── Permissions ───────────────────────────────────────────────────────────
+  const requestPermissions = async () => {
+    await Audio.requestPermissionsAsync();
   };
 
-  const triggerHaptic = (pattern) => {
+  // ── Vibration ─────────────────────────────────────────────────────────────
+  const fireVibration = (pattern: number[]) => {
     if (Platform.OS === 'ios') {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     } else {
-      Vibration.vibrate(pattern);
+      // Android: pattern must start with a silence (0) for Vibration.vibrate
+      // Our pattern alternates vibrate/pause starting with vibrate
+      // So prepend 0 to make it [0, vib, pause, vib, ...]
+      Vibration.vibrate([0, ...pattern]);
     }
   };
 
-  // ── MIC RECORDING ──
+  // ── Mic Recording ─────────────────────────────────────────────────────────
   const startRecording = async () => {
+    if (isRecording || isSending) return;
     try {
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
       const { recording } = await Audio.Recording.createAsync(
         Audio.RecordingOptionsPresets.HIGH_QUALITY
       );
-      setRecording(recording);
+      recordingRef.current = recording;
       setIsRecording(true);
       setTranscribedText('Listening...');
     } catch (err) {
-      console.error('Record error:', err);
+      setTranscribedText('Mic error — try again');
     }
   };
 
   const stopRecording = async () => {
+    if (!isRecording || !recordingRef.current) return;
+    setIsRecording(false);
+    setIsSending(true);
+    setTranscribedText('Processing...');
     try {
-      setIsRecording(false);
-      setTranscribedText('Sending...');
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
-      await sendAudioToBackend(uri);
-    } catch (err) {
-      console.error('Stop error:', err);
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      recordingRef.current = null;
+      if (uri) await uploadAudio(uri);
+    } catch {
       setTranscribedText('Error — try again');
+      setIsSending(false);
     }
   };
 
-  const sendAudioToBackend = async (uri) => {
+  const uploadAudio = async (uri: string) => {
     try {
-      const formData = new FormData();
-      formData.append('file', { uri, name: 'audio.m4a', type: 'audio/m4a' });
-      const response = await fetch(`${BACKEND_URL}/translate-speech`, {
+      const form = new FormData();
+      form.append('file', { uri, name: 'audio.m4a', type: 'audio/m4a' } as any);
+      const res = await fetch(`${BACKEND_URL}/translate-speech`, {
         method: 'POST',
-        body: formData,
-        headers: { 'Content-Type': 'multipart/form-data' },
+        body: form,
       });
-      const data = await response.json();
+      const data = await res.json();
       if (data.status === 'success') {
-        setTranscribedText(data.text);
+        setTranscribedText(`"${data.text}"`);
       } else {
-        setTranscribedText('Not recognized');
+        setTranscribedText('Not recognized — try again');
       }
-    } catch (err) {
-      console.error('Upload error:', err);
-      setTranscribedText('Upload failed');
+    } catch {
+      setTranscribedText('Upload failed — check connection');
+    } finally {
+      setIsSending(false);
     }
   };
 
-  // ── DRAWING ──
-  const drawPanResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => mode === 'draw',
-    onMoveShouldSetPanResponder: () => mode === 'draw',
+  // ── Quick Phrases ─────────────────────────────────────────────────────────
+  const sendQuickPhrase = (phrase: typeof QUICK_PHRASES[0]) => {
+    Speech.speak(phrase.label, { language: 'en' });
+    fireVibration(phrase.pattern);
+    setLastAction(phrase.label);
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ action: phrase.label }));
+    }
+  };
 
-    onPanResponderGrant: (evt) => {
-      const { locationX, locationY } = evt.nativeEvent;
-      setCurrentStroke([{ x: locationX, y: locationY }]);
-      setCurrentPath(`M${locationX},${locationY}`);
-      if (recognizeTimer.current) clearTimeout(recognizeTimer.current);
-    },
+  // ── Keyboard ──────────────────────────────────────────────────────────────
+  const tapLetter = (letter: string) => {
+    setTypedWord(w => w + letter);
+    fireVibration([50]);
+  };
 
-    onPanResponderMove: (evt) => {
-      const { locationX, locationY } = evt.nativeEvent;
-      setCurrentStroke(prev => [...prev, { x: locationX, y: locationY }]);
-      setCurrentPath(prev => prev + ` L${locationX},${locationY}`);
-    },
+  const deleteLetter = () => {
+    setTypedWord(w => w.slice(0, -1));
+  };
 
-    onPanResponderRelease: () => {
-      // Save completed stroke
-      setStrokes(prev => {
-        const newStrokes = [...prev, currentStroke];
-        // Auto-recognize after 800ms of no new strokes
-        if (recognizeTimer.current) clearTimeout(recognizeTimer.current);
-        recognizeTimer.current = setTimeout(() => {
-          const letter = recognizeLetter(newStrokes);
-          setCurrentLetter(letter);
-          setCurrentWord(w => w + letter);
-          setStrokes([]);
-          setPaths([]);
-          setCurrentPath('');
-          triggerHaptic([100]); // short buzz feedback
-        }, 800);
-        return newStrokes;
-      });
-      setPaths(prev => [...prev, currentPath]);
-      setCurrentPath('');
-    },
-  });
+  const addSpace = () => {
+    setTypedWord(w => w + ' ');
+  };
 
   const speakWord = () => {
-    if (!currentWord) return;
-    Speech.speak(currentWord, { language: 'en' });
-    // Also send to backend for Morse vibration
+    const word = typedWord.trim();
+    if (!word) return;
+    Speech.speak(word, { language: 'en' });
+    fireVibration([100, 100, 100]);
+    setLastAction(`Spoke: "${word}"`);
     if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: currentWord }));
+      ws.current.send(JSON.stringify({ action: word }));
     }
-    triggerHaptic([100, 100, 100]);
+    setTypedWord('');
   };
 
-  const clearWord = () => {
-    setCurrentWord('');
-    setCurrentLetter('');
-    setStrokes([]);
-    setPaths([]);
-    setCurrentPath('');
-  };
+  const clearWord = () => setTypedWord('');
 
-  const deleteLastLetter = () => {
-    setCurrentWord(w => w.slice(0, -1));
-  };
+  // ── Status indicator ──────────────────────────────────────────────────────
+  const statusColor = wsStatus === 'connected' ? '#00ff88' : wsStatus === 'connecting' ? '#ffb800' : '#ff4d4d';
+  const statusLabel = wsStatus === 'connected' ? 'Connected' : wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...';
 
-  // ── SWIPE GESTURES (listen mode only) ──
-  const swipePanResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => mode === 'listen',
-    onPanResponderRelease: (evt, gestureState) => {
-      if (mode !== 'listen') return;
-      const { dx, dy } = gestureState;
-      if (dy < -100) handleQuickAction('I need help', [500, 200, 500]);
-      else if (dx > 100) handleQuickAction('Yes', [100]);
-      else if (dx < -100) handleQuickAction('No', [300]);
-      else if (dy > 100) handleQuickAction('Thank you', [100, 100, 100]);
-    },
-  });
-
-  const handleQuickAction = (message, pattern) => {
-    Speech.speak(message, { language: 'en' });
-    triggerHaptic(pattern);
-    setTranscribedText(message);
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: message }));
-    }
-  };
-
-  const statusColor = status === 'Connected' ? '#00ff88' : '#ff4d4d';
-  const CANVAS_SIZE = width - 48;
-
+  // ─── RENDER ───────────────────────────────────────────────────────────────
   return (
-    <View style={styles.container}>
-      {/* Status bar */}
-      <View style={styles.statusBar}>
-        <View style={[styles.dot, { backgroundColor: statusColor }]} />
-        <Text style={[styles.statusText, { color: statusColor }]}>{status}</Text>
-      </View>
+    <SafeAreaView style={styles.safe}>
+      <View style={styles.container}>
 
-      {/* Mode toggle */}
-      <View style={styles.modeToggle}>
-        <TouchableOpacity
-          style={[styles.modeBtn, mode === 'listen' && styles.modeBtnActive]}
-          onPress={() => setMode('listen')}
-        >
-          <Text style={[styles.modeBtnText, mode === 'listen' && styles.modeBtnTextActive]}>
-            🎤 Listen
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.modeBtn, mode === 'draw' && styles.modeBtnActive]}
-          onPress={() => setMode('draw')}
-        >
-          <Text style={[styles.modeBtnText, mode === 'draw' && styles.modeBtnTextActive]}>
-            ✏️ Draw
-          </Text>
-        </TouchableOpacity>
-      </View>
+        {/* ── Header ── */}
+        <View style={styles.header}>
+          <Text style={styles.logo}>SENSEX</Text>
+          <View style={styles.statusPill}>
+            <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
+            <Text style={[styles.statusText, { color: statusColor }]}>{statusLabel}</Text>
+          </View>
+        </View>
 
-      {/* LISTEN MODE */}
-      {mode === 'listen' && (
-        <View style={styles.listenContainer} {...swipePanResponder.panHandlers}>
-          {transcribedText ? (
-            <Text style={styles.transcribedText}>{transcribedText}</Text>
-          ) : null}
-
-          {/* Mic button */}
+        {/* ── Mode Toggle ── */}
+        <View style={styles.modeRow}>
           <TouchableOpacity
-            style={[styles.micButton, isRecording && styles.micButtonActive]}
-            onPressIn={startRecording}
-            onPressOut={stopRecording}
-            activeOpacity={0.8}
+            style={[styles.modeBtn, mode === 'listen' && styles.modeBtnOn]}
+            onPress={() => setMode('listen')}
           >
-            <Text style={styles.micIcon}>{isRecording ? '⏹' : '🎤'}</Text>
-            <Text style={styles.micLabel}>
-              {isRecording ? 'Release to send' : 'Hold to speak'}
+            <Text style={[styles.modeBtnText, mode === 'listen' && styles.modeBtnTextOn]}>
+              🎤  LISTEN
             </Text>
           </TouchableOpacity>
-
-          {/* Swipe instructions */}
-          <View style={styles.instructions}>
-            <Text style={styles.instruction}>↑  Swipe up — I need help</Text>
-            <Text style={styles.instruction}>→  Swipe right — Yes</Text>
-            <Text style={styles.instruction}>←  Swipe left — No</Text>
-            <Text style={styles.instruction}>↓  Swipe down — Thank you</Text>
-          </View>
+          <TouchableOpacity
+            style={[styles.modeBtn, mode === 'type' && styles.modeBtnOn]}
+            onPress={() => setMode('type')}
+          >
+            <Text style={[styles.modeBtnText, mode === 'type' && styles.modeBtnTextOn]}>
+              ⌨️  TYPE
+            </Text>
+          </TouchableOpacity>
         </View>
-      )}
 
-      {/* DRAW MODE */}
-      {mode === 'draw' && (
-        <View style={styles.drawContainer}>
-          {/* Word display */}
-          <View style={styles.wordDisplay}>
-            <Text style={styles.wordText}>{currentWord || 'Draw letters below'}</Text>
-            {currentLetter ? (
-              <Text style={styles.letterHint}>Detected: {currentLetter}</Text>
+        {/* ── LISTEN MODE ── */}
+        {mode === 'listen' && (
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={styles.listenContent}
+            showsVerticalScrollIndicator={false}
+          >
+            {/* Transcription display */}
+            <View style={styles.textDisplay}>
+              {isSending ? (
+                <ActivityIndicator color="#00ff88" />
+              ) : (
+                <Text style={styles.textDisplayText} numberOfLines={3}>
+                  {transcribedText || 'Hold mic to speak'}
+                </Text>
+              )}
+            </View>
+
+            {/* Mic Button */}
+            <TouchableOpacity
+              style={[styles.micBtn, isRecording && styles.micBtnActive]}
+              onPressIn={startRecording}
+              onPressOut={stopRecording}
+              disabled={isSending}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.micBtnIcon}>{isRecording ? '⏹' : '🎤'}</Text>
+              <Text style={styles.micBtnLabel}>
+                {isSending ? 'Processing...' : isRecording ? 'Release to send' : 'Hold to speak'}
+              </Text>
+            </TouchableOpacity>
+
+            {/* Quick Phrases */}
+            <Text style={styles.sectionLabel}>QUICK PHRASES</Text>
+            <View style={styles.phrasesGrid}>
+              {QUICK_PHRASES.map((p) => (
+                <TouchableOpacity
+                  key={p.label}
+                  style={styles.phraseBtn}
+                  onPress={() => sendQuickPhrase(p)}
+                >
+                  <Text style={styles.phraseBtnText}>{p.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {lastAction ? (
+              <Text style={styles.lastActionText}>↳ {lastAction}</Text>
+            ) : null}
+          </ScrollView>
+        )}
+
+        {/* ── TYPE MODE ── */}
+        {mode === 'type' && (
+          <View style={styles.typeContainer}>
+            {/* Word display */}
+            <View style={styles.wordDisplay}>
+              <Text style={styles.wordText} numberOfLines={2}>
+                {typedWord || 'Tap letters to spell'}
+              </Text>
+            </View>
+
+            {/* Action buttons */}
+            <View style={styles.actionRow}>
+              <TouchableOpacity style={styles.actionBtn} onPress={deleteLetter}>
+                <Text style={styles.actionBtnText}>⌫</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionBtn, styles.speakActionBtn, !typedWord.trim() && styles.actionBtnDisabled]}
+                onPress={speakWord}
+                disabled={!typedWord.trim()}
+              >
+                <Text style={[styles.actionBtnText, styles.speakActionBtnText]}>🔊 SPEAK</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={clearWord}>
+                <Text style={styles.actionBtnText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Keyboard */}
+            <View style={styles.keyboard}>
+              {KEYBOARD_ROWS.map((row, ri) => (
+                <View key={ri} style={styles.keyRow}>
+                  {row.map((letter) => (
+                    <TouchableOpacity
+                      key={letter}
+                      style={styles.key}
+                      onPress={() => tapLetter(letter)}
+                      activeOpacity={0.6}
+                    >
+                      <Text style={styles.keyText}>{letter}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              ))}
+              {/* Space bar row */}
+              <View style={styles.keyRow}>
+                <TouchableOpacity style={[styles.key, styles.keySpace]} onPress={addSpace}>
+                  <Text style={styles.keyText}>SPACE</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {lastAction ? (
+              <Text style={styles.lastActionText}>↳ {lastAction}</Text>
             ) : null}
           </View>
+        )}
 
-          {/* Drawing canvas */}
-          <View
-            style={[styles.canvas, { width: CANVAS_SIZE, height: CANVAS_SIZE * 0.6 }]}
-            {...drawPanResponder.panHandlers}
-          >
-            <Svg width={CANVAS_SIZE} height={CANVAS_SIZE * 0.6}>
-              {paths.map((p, i) => (
-                <Path key={i} d={p} stroke="#00ff88" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round" />
-              ))}
-              {currentPath ? (
-                <Path d={currentPath} stroke="#ffffff" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round" />
-              ) : null}
-            </Svg>
-            {paths.length === 0 && currentPath === '' && (
-              <Text style={styles.canvasHint}>Draw a letter here</Text>
-            )}
-          </View>
-
-          {/* Controls */}
-          <View style={styles.drawControls}>
-            <TouchableOpacity style={styles.controlBtn} onPress={deleteLastLetter}>
-              <Text style={styles.controlBtnText}>⌫</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.controlBtn, styles.speakBtn]}
-              onPress={speakWord}
-              disabled={!currentWord}
-            >
-              <Text style={styles.controlBtnText}>🔊 Speak</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.controlBtn} onPress={clearWord}>
-              <Text style={styles.controlBtnText}>✕</Text>
-            </TouchableOpacity>
-          </View>
-
-          <Text style={styles.drawHint}>
-            Draw a letter → wait → it gets added to word
-          </Text>
-        </View>
-      )}
-    </View>
+      </View>
+    </SafeAreaView>
   );
 }
 
+// ─── STYLES ───────────────────────────────────────────────────────────────────
+const KEY_SIZE = Math.floor((width - 48) / 10);
+
 const styles = StyleSheet.create({
+  safe: {
+    flex: 1,
+    backgroundColor: '#050508',
+  },
   container: {
     flex: 1,
-    backgroundColor: '#000',
-    alignItems: 'center',
+    backgroundColor: '#050508',
   },
-  statusBar: {
-    position: 'absolute',
-    top: 60,
+
+  // Header
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    backgroundColor: '#111',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 8,
-    borderWidth: 0.5,
-    borderColor: '#222',
-    zIndex: 10,
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 10,
+    borderBottomWidth: 0.5,
+    borderBottomColor: '#1a1a2e',
   },
-  dot: { width: 8, height: 8, borderRadius: 4 },
+  logo: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    fontSize: 20,
+    fontWeight: '900',
+    color: '#00ff88',
+    letterSpacing: 6,
+  },
+  statusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#0d0d1a',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 0.5,
+    borderColor: '#1a1a2e',
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
   statusText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    fontSize: 13,
+    fontSize: 10,
     fontWeight: '600',
+    letterSpacing: 1,
   },
-  modeToggle: {
+
+  // Mode toggle
+  modeRow: {
     flexDirection: 'row',
-    marginTop: 120,
-    backgroundColor: '#111',
-    borderRadius: 12,
-    padding: 4,
-    gap: 4,
+    margin: 16,
+    backgroundColor: '#0d0d1a',
+    borderRadius: 10,
+    padding: 3,
     borderWidth: 0.5,
-    borderColor: '#222',
+    borderColor: '#1a1a2e',
   },
   modeBtn: {
-    paddingHorizontal: 24,
-    paddingVertical: 10,
+    flex: 1,
+    paddingVertical: 11,
     borderRadius: 8,
+    alignItems: 'center',
   },
-  modeBtnActive: { backgroundColor: '#00ff88' },
+  modeBtnOn: {
+    backgroundColor: '#00ff88',
+  },
   modeBtnText: {
-    color: '#444',
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  modeBtnTextActive: { color: '#000' },
-
-  // LISTEN MODE
-  listenContainer: {
-    flex: 1,
-    width: '100%',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingBottom: 40,
-  },
-  transcribedText: {
-    position: 'absolute',
-    top: 20,
-    color: '#00ff88',
-    fontSize: 20,
-    fontWeight: '700',
-    letterSpacing: 1,
-    textAlign: 'center',
-    paddingHorizontal: 20,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-  },
-  micButton: {
-    width: 140,
-    height: 140,
-    borderRadius: 70,
-    backgroundColor: '#111',
-    borderWidth: 1.5,
-    borderColor: '#333',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 60,
-  },
-  micButtonActive: { backgroundColor: '#1a0000', borderColor: '#ff4d4d' },
-  micIcon: { fontSize: 40, marginBottom: 8 },
-  micLabel: {
-    color: '#444',
     fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-  },
-  instructions: {
-    position: 'absolute',
-    bottom: 40,
-    gap: 12,
-    alignItems: 'flex-start',
-  },
-  instruction: {
+    fontWeight: '700',
     color: '#333',
-    fontSize: 16,
+    letterSpacing: 2,
+  },
+  modeBtnTextOn: {
+    color: '#000',
+  },
+
+  // Listen mode
+  scroll: { flex: 1 },
+  listenContent: {
+    paddingHorizontal: 16,
+    paddingBottom: 30,
+    alignItems: 'center',
+  },
+  textDisplay: {
+    width: '100%',
+    minHeight: 80,
+    backgroundColor: '#0d0d1a',
+    borderRadius: 12,
+    borderWidth: 0.5,
+    borderColor: '#1a1a2e',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    marginBottom: 24,
+  },
+  textDisplayText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    fontSize: 18,
+    color: '#00ff88',
+    fontWeight: '600',
+    textAlign: 'center',
+    letterSpacing: 1,
+  },
+  micBtn: {
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: '#0d0d1a',
+    borderWidth: 1.5,
+    borderColor: '#1a1a2e',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 32,
+  },
+  micBtnActive: {
+    backgroundColor: '#1a0000',
+    borderColor: '#ff4d4d',
+  },
+  micBtnIcon: { fontSize: 44, marginBottom: 8 },
+  micBtnLabel: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#444',
+    fontSize: 11,
+    letterSpacing: 1,
+  },
+  sectionLabel: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    fontSize: 9,
+    color: '#333',
+    letterSpacing: 3,
+    alignSelf: 'flex-start',
+    marginBottom: 10,
+  },
+  phrasesGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    width: '100%',
+    justifyContent: 'flex-start',
+  },
+  phraseBtn: {
+    backgroundColor: '#0d0d1a',
+    borderWidth: 0.5,
+    borderColor: '#1a1a2e',
+    borderRadius: 8,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  phraseBtnText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#00ff88',
+    fontSize: 13,
+    fontWeight: '600',
+    letterSpacing: 1,
+  },
+  lastActionText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#333',
+    fontSize: 10,
+    marginTop: 16,
     letterSpacing: 1,
   },
 
-  // DRAW MODE
-  drawContainer: {
+  // Type mode
+  typeContainer: {
     flex: 1,
-    width: '100%',
-    alignItems: 'center',
-    paddingTop: 20,
-    paddingHorizontal: 24,
+    paddingHorizontal: 16,
   },
   wordDisplay: {
     width: '100%',
-    minHeight: 60,
-    backgroundColor: '#111',
+    minHeight: 70,
+    backgroundColor: '#0d0d1a',
     borderRadius: 12,
     borderWidth: 0.5,
-    borderColor: '#222',
+    borderColor: '#1a1a2e',
     justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
     paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginBottom: 12,
   },
   wordText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    fontSize: 26,
     color: '#00ff88',
-    fontSize: 28,
     fontWeight: '700',
-    letterSpacing: 4,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    letterSpacing: 3,
   },
-  letterHint: {
-    color: '#555',
-    fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    marginTop: 4,
-  },
-  canvas: {
-    backgroundColor: '#0a0a0a',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#222',
-    overflow: 'hidden',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  canvasHint: {
-    position: 'absolute',
-    color: '#222',
-    fontSize: 16,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-  },
-  drawControls: {
+  actionRow: {
     flexDirection: 'row',
-    gap: 12,
-    marginTop: 16,
-    width: '100%',
-    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 14,
   },
-  controlBtn: {
-    backgroundColor: '#111',
+  actionBtn: {
+    backgroundColor: '#0d0d1a',
     borderWidth: 0.5,
-    borderColor: '#333',
-    borderRadius: 12,
-    paddingHorizontal: 20,
-    paddingVertical: 14,
+    borderColor: '#1a1a2e',
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  speakBtn: {
-    backgroundColor: '#003320',
-    borderColor: '#00ff88',
+  speakActionBtn: {
     flex: 1,
+    backgroundColor: '#002a1a',
+    borderColor: '#00ff88',
   },
-  controlBtnText: {
+  speakActionBtnText: {
     color: '#00ff88',
-    fontSize: 18,
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
   },
-  drawHint: {
-    color: '#333',
-    fontSize: 12,
+  actionBtnDisabled: {
+    opacity: 0.3,
+  },
+  actionBtnText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    marginTop: 12,
-    textAlign: 'center',
+    color: '#555',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+
+  // Keyboard
+  keyboard: {
+    gap: 6,
+  },
+  keyRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 4,
+  },
+  key: {
+    width: KEY_SIZE,
+    height: KEY_SIZE * 1.1,
+    backgroundColor: '#0d0d1a',
+    borderRadius: 6,
+    borderWidth: 0.5,
+    borderColor: '#1a1a2e',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  keySpace: {
+    width: KEY_SIZE * 6,
+    height: KEY_SIZE * 0.9,
+  },
+  keyText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#ccc',
+    fontSize: 13,
+    fontWeight: '600',
   },
 });
