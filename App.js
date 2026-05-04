@@ -8,8 +8,10 @@ import {
   TouchableOpacity,
   ScrollView,
   SafeAreaView,
-  Dimensions,
   ActivityIndicator,
+  TextInput,
+  PanResponder,
+  Keyboard,
 } from 'react-native';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
@@ -21,13 +23,6 @@ const BACKEND_URL = 'https://sensex-backend.onrender.com';
 const RECONNECT_DELAY = 3000;
 const PING_INTERVAL = 25000;
 
-// ─── KEYBOARD LAYOUT ─────────────────────────────────────────────────────────
-const KEYBOARD_ROWS = [
-  ['Q','W','E','R','T','Y','U','I','O','P'],
-  ['A','S','D','F','G','H','J','K','L'],
-  ['Z','X','C','V','B','N','M'],
-];
-
 const QUICK_PHRASES = [
   { label: 'Yes', pattern: [100] },
   { label: 'No', pattern: [300] },
@@ -37,8 +32,6 @@ const QUICK_PHRASES = [
   { label: 'Repeat', pattern: [100, 100, 300] },
 ];
 
-const { width } = Dimensions.get('window');
-
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 export default function SensEx() {
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
@@ -46,7 +39,7 @@ export default function SensEx() {
   const [isRecording, setIsRecording] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [transcribedText, setTranscribedText] = useState('');
-  const [typedWord, setTypedWord] = useState('');
+  const [typedText, setTypedText] = useState('');
   const [lastAction, setLastAction] = useState('');
 
   const ws = useRef<WebSocket | null>(null);
@@ -54,6 +47,7 @@ export default function SensEx() {
   const pingTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const isConnecting = useRef(false);
+  const inputRef = useRef<TextInput>(null);
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const connectWS = useCallback(() => {
@@ -98,14 +92,14 @@ export default function SensEx() {
 
     socket.onerror = () => {
       isConnecting.current = false;
-      socket.close();
+      try { socket.close(); } catch {}
     };
 
     ws.current = socket;
   }, []);
 
   useEffect(() => {
-    requestPermissions();
+    Audio.requestPermissionsAsync();
     connectWS();
     return () => {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -117,19 +111,11 @@ export default function SensEx() {
     };
   }, [connectWS]);
 
-  // ── Permissions ───────────────────────────────────────────────────────────
-  const requestPermissions = async () => {
-    await Audio.requestPermissionsAsync();
-  };
-
   // ── Vibration ─────────────────────────────────────────────────────────────
   const fireVibration = (pattern: number[]) => {
     if (Platform.OS === 'ios') {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     } else {
-      // Android: pattern must start with a silence (0) for Vibration.vibrate
-      // Our pattern alternates vibrate/pause starting with vibrate
-      // So prepend 0 to make it [0, vib, pause, vib, ...]
       Vibration.vibrate([0, ...pattern]);
     }
   };
@@ -148,7 +134,7 @@ export default function SensEx() {
       recordingRef.current = recording;
       setIsRecording(true);
       setTranscribedText('Listening...');
-    } catch (err) {
+    } catch {
       setTranscribedText('Mic error — try again');
     }
   };
@@ -173,10 +159,7 @@ export default function SensEx() {
     try {
       const form = new FormData();
       form.append('file', { uri, name: 'audio.m4a', type: 'audio/m4a' } as any);
-      const res = await fetch(`${BACKEND_URL}/translate-speech`, {
-        method: 'POST',
-        body: form,
-      });
+      const res = await fetch(`${BACKEND_URL}/translate-speech`, { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'success') {
         setTranscribedText(`"${data.text}"`);
@@ -200,37 +183,59 @@ export default function SensEx() {
     }
   };
 
-  // ── Keyboard ──────────────────────────────────────────────────────────────
-  const tapLetter = (letter: string) => {
-    setTypedWord(w => w + letter);
-    fireVibration([50]);
-  };
+  // ── Swipe gestures for listen mode ────────────────────────────────────────
+  const swipePanResponder = PanResponder.create({
+    onStartShouldSetPanResponder: () => mode === 'listen',
+    onMoveShouldSetPanResponder: (_, g) =>
+      mode === 'listen' && (Math.abs(g.dx) > 10 || Math.abs(g.dy) > 10),
+    onPanResponderRelease: (_, g) => {
+      if (mode !== 'listen') return;
+      const { dx, dy } = g;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+      if (absDx < 50 && absDy < 50) return; // too small, ignore
 
-  const deleteLetter = () => {
-    setTypedWord(w => w.slice(0, -1));
-  };
+      let label = '';
+      let pattern: number[] = [];
 
-  const addSpace = () => {
-    setTypedWord(w => w + ' ');
-  };
+      if (absDy > absDx) {
+        if (dy < 0) { label = 'I need help'; pattern = [500, 200, 500]; }
+        else { label = 'Thank you'; pattern = [100, 100, 100]; }
+      } else {
+        if (dx > 0) { label = 'Yes'; pattern = [100]; }
+        else { label = 'No'; pattern = [300]; }
+      }
 
-  const speakWord = () => {
-    const word = typedWord.trim();
-    if (!word) return;
-    Speech.speak(word, { language: 'en' });
+      Speech.speak(label, { language: 'en' });
+      fireVibration(pattern);
+      setLastAction(label);
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ action: label }));
+      }
+    },
+  });
+
+  // ── Speak typed text ──────────────────────────────────────────────────────
+  const speakTyped = () => {
+    const text = typedText.trim();
+    if (!text) return;
+    Keyboard.dismiss();
+    Speech.speak(text, { language: 'en' });
     fireVibration([100, 100, 100]);
-    setLastAction(`Spoke: "${word}"`);
+    setLastAction(`"${text}"`);
     if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: word }));
+      ws.current.send(JSON.stringify({ action: text }));
     }
-    setTypedWord('');
+    setTypedText('');
   };
 
-  const clearWord = () => setTypedWord('');
-
-  // ── Status indicator ──────────────────────────────────────────────────────
-  const statusColor = wsStatus === 'connected' ? '#00ff88' : wsStatus === 'connecting' ? '#ffb800' : '#ff4d4d';
-  const statusLabel = wsStatus === 'connected' ? 'Connected' : wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...';
+  // ── Status ────────────────────────────────────────────────────────────────
+  const statusColor =
+    wsStatus === 'connected' ? '#00ff88' :
+    wsStatus === 'connecting' ? '#ffb800' : '#ff4d4d';
+  const statusLabel =
+    wsStatus === 'connected' ? 'Connected' :
+    wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...';
 
   // ─── RENDER ───────────────────────────────────────────────────────────────
   return (
@@ -250,7 +255,7 @@ export default function SensEx() {
         <View style={styles.modeRow}>
           <TouchableOpacity
             style={[styles.modeBtn, mode === 'listen' && styles.modeBtnOn]}
-            onPress={() => setMode('listen')}
+            onPress={() => { setMode('listen'); Keyboard.dismiss(); }}
           >
             <Text style={[styles.modeBtnText, mode === 'listen' && styles.modeBtnTextOn]}>
               🎤  LISTEN
@@ -261,27 +266,53 @@ export default function SensEx() {
             onPress={() => setMode('type')}
           >
             <Text style={[styles.modeBtnText, mode === 'type' && styles.modeBtnTextOn]}>
-              ⌨️  TYPE
+              ✍️  TYPE
             </Text>
           </TouchableOpacity>
         </View>
 
         {/* ── LISTEN MODE ── */}
         {mode === 'listen' && (
-          <ScrollView
-            style={styles.scroll}
-            contentContainerStyle={styles.listenContent}
-            showsVerticalScrollIndicator={false}
-          >
+          <View style={styles.listenContainer} {...swipePanResponder.panHandlers}>
+
             {/* Transcription display */}
             <View style={styles.textDisplay}>
               {isSending ? (
                 <ActivityIndicator color="#00ff88" />
               ) : (
                 <Text style={styles.textDisplayText} numberOfLines={3}>
-                  {transcribedText || 'Hold mic to speak'}
+                  {transcribedText || 'Hold mic · Swipe to reply'}
                 </Text>
               )}
+            </View>
+
+            {/* Last action */}
+            {lastAction ? (
+              <Text style={styles.lastActionText}>↳ {lastAction}</Text>
+            ) : null}
+
+            {/* Quick Phrases */}
+            <Text style={styles.sectionLabel}>QUICK PHRASES</Text>
+            <View style={styles.phrasesGrid}>
+              {QUICK_PHRASES.map((p) => (
+                <TouchableOpacity
+                  key={p.label}
+                  style={styles.phraseBtn}
+                  onPress={() => sendQuickPhrase(p)}
+                >
+                  <Text style={styles.phraseBtnText}>{p.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {/* Swipe hints */}
+            <View style={styles.swipeHints}>
+              <Text style={styles.swipeHint}>↑ I need help</Text>
+              <View style={styles.swipeHintRow}>
+                <Text style={styles.swipeHint}>← No</Text>
+                <Text style={styles.swipeHint}>Yes →</Text>
+              </View>
+              <Text style={styles.swipeHint}>↓ Thank you</Text>
             </View>
 
             {/* Mic Button */}
@@ -298,80 +329,49 @@ export default function SensEx() {
               </Text>
             </TouchableOpacity>
 
-            {/* Quick Phrases */}
-            <Text style={styles.sectionLabel}>QUICK PHRASES</Text>
-            <View style={styles.phrasesGrid}>
-              {QUICK_PHRASES.map((p) => (
-                <TouchableOpacity
-                  key={p.label}
-                  style={styles.phraseBtn}
-                  onPress={() => sendQuickPhrase(p)}
-                >
-                  <Text style={styles.phraseBtnText}>{p.label}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            {lastAction ? (
-              <Text style={styles.lastActionText}>↳ {lastAction}</Text>
-            ) : null}
-          </ScrollView>
+          </View>
         )}
 
         {/* ── TYPE MODE ── */}
         {mode === 'type' && (
           <View style={styles.typeContainer}>
-            {/* Word display */}
-            <View style={styles.wordDisplay}>
-              <Text style={styles.wordText} numberOfLines={2}>
-                {typedWord || 'Tap letters to spell'}
-              </Text>
-            </View>
 
-            {/* Action buttons */}
-            <View style={styles.actionRow}>
-              <TouchableOpacity style={styles.actionBtn} onPress={deleteLetter}>
-                <Text style={styles.actionBtnText}>⌫</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.actionBtn, styles.speakActionBtn, !typedWord.trim() && styles.actionBtnDisabled]}
-                onPress={speakWord}
-                disabled={!typedWord.trim()}
-              >
-                <Text style={[styles.actionBtnText, styles.speakActionBtnText]}>🔊 SPEAK</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.actionBtn} onPress={clearWord}>
-                <Text style={styles.actionBtnText}>✕</Text>
-              </TouchableOpacity>
-            </View>
+            <Text style={styles.typeHint}>
+              Use Gboard swipe typing to build your message
+            </Text>
 
-            {/* Keyboard */}
-            <View style={styles.keyboard}>
-              {KEYBOARD_ROWS.map((row, ri) => (
-                <View key={ri} style={styles.keyRow}>
-                  {row.map((letter) => (
-                    <TouchableOpacity
-                      key={letter}
-                      style={styles.key}
-                      onPress={() => tapLetter(letter)}
-                      activeOpacity={0.6}
-                    >
-                      <Text style={styles.keyText}>{letter}</Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              ))}
-              {/* Space bar row */}
-              <View style={styles.keyRow}>
-                <TouchableOpacity style={[styles.key, styles.keySpace]} onPress={addSpace}>
-                  <Text style={styles.keyText}>SPACE</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
+            {/* System keyboard text input */}
+            <TextInput
+              ref={inputRef}
+              style={styles.textInput}
+              value={typedText}
+              onChangeText={setTypedText}
+              placeholder="Swipe or type here..."
+              placeholderTextColor="#333"
+              multiline
+              autoFocus={false}
+              returnKeyType="done"
+              blurOnSubmit={false}
+            />
+
+            {/* Speak button */}
+            <TouchableOpacity
+              style={[styles.speakBtn, !typedText.trim() && styles.speakBtnDisabled]}
+              onPress={speakTyped}
+              disabled={!typedText.trim()}
+            >
+              <Text style={styles.speakBtnText}>🔊  SPEAK</Text>
+            </TouchableOpacity>
+
+            {/* Clear button */}
+            <TouchableOpacity style={styles.clearBtn} onPress={() => setTypedText('')}>
+              <Text style={styles.clearBtnText}>Clear</Text>
+            </TouchableOpacity>
 
             {lastAction ? (
-              <Text style={styles.lastActionText}>↳ {lastAction}</Text>
+              <Text style={styles.lastActionText}>↳ Spoke: {lastAction}</Text>
             ) : null}
+
           </View>
         )}
 
@@ -381,19 +381,10 @@ export default function SensEx() {
 }
 
 // ─── STYLES ───────────────────────────────────────────────────────────────────
-const KEY_SIZE = Math.floor((width - 48) / 10);
-
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: '#050508',
-  },
-  container: {
-    flex: 1,
-    backgroundColor: '#050508',
-  },
+  safe: { flex: 1, backgroundColor: '#050508' },
+  container: { flex: 1, backgroundColor: '#050508' },
 
-  // Header
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -422,11 +413,7 @@ const styles = StyleSheet.create({
     borderWidth: 0.5,
     borderColor: '#1a1a2e',
   },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-  },
+  statusDot: { width: 6, height: 6, borderRadius: 3 },
   statusText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
     fontSize: 10,
@@ -434,7 +421,6 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
 
-  // Mode toggle
   modeRow: {
     flexDirection: 'row',
     margin: 16,
@@ -450,9 +436,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
   },
-  modeBtnOn: {
-    backgroundColor: '#00ff88',
-  },
+  modeBtnOn: { backgroundColor: '#00ff88' },
   modeBtnText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
     fontSize: 12,
@@ -460,16 +444,15 @@ const styles = StyleSheet.create({
     color: '#333',
     letterSpacing: 2,
   },
-  modeBtnTextOn: {
-    color: '#000',
-  },
+  modeBtnTextOn: { color: '#000' },
 
   // Listen mode
-  scroll: { flex: 1 },
-  listenContent: {
-    paddingHorizontal: 16,
-    paddingBottom: 30,
+  listenContainer: {
+    flex: 1,
     alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingBottom: 40,
   },
   textDisplay: {
     width: '100%',
@@ -482,7 +465,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 20,
     paddingVertical: 16,
-    marginBottom: 24,
   },
   textDisplayText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
@@ -492,27 +474,12 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     letterSpacing: 1,
   },
-  micBtn: {
-    width: 160,
-    height: 160,
-    borderRadius: 80,
-    backgroundColor: '#0d0d1a',
-    borderWidth: 1.5,
-    borderColor: '#1a1a2e',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 32,
-  },
-  micBtnActive: {
-    backgroundColor: '#1a0000',
-    borderColor: '#ff4d4d',
-  },
-  micBtnIcon: { fontSize: 44, marginBottom: 8 },
-  micBtnLabel: {
+  lastActionText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    color: '#444',
-    fontSize: 11,
+    color: '#00ff88',
+    fontSize: 13,
     letterSpacing: 1,
+    fontWeight: '600',
   },
   sectionLabel: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
@@ -520,14 +487,13 @@ const styles = StyleSheet.create({
     color: '#333',
     letterSpacing: 3,
     alignSelf: 'flex-start',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   phrasesGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
     width: '100%',
-    justifyContent: 'flex-start',
   },
   phraseBtn: {
     backgroundColor: '#0d0d1a',
@@ -544,98 +510,90 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     letterSpacing: 1,
   },
-  lastActionText: {
+  swipeHints: {
+    alignItems: 'center',
+    gap: 8,
+  },
+  swipeHintRow: {
+    flexDirection: 'row',
+    gap: 60,
+  },
+  swipeHint: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    color: '#333',
-    fontSize: 10,
-    marginTop: 16,
+    color: '#2a2a4a',
+    fontSize: 14,
+    letterSpacing: 1,
+  },
+  micBtn: {
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: '#0d0d1a',
+    borderWidth: 1.5,
+    borderColor: '#1a1a2e',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  micBtnActive: {
+    backgroundColor: '#1a0000',
+    borderColor: '#ff4d4d',
+  },
+  micBtnIcon: { fontSize: 44, marginBottom: 8 },
+  micBtnLabel: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#444',
+    fontSize: 11,
     letterSpacing: 1,
   },
 
   // Type mode
   typeContainer: {
     flex: 1,
-    paddingHorizontal: 16,
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    gap: 14,
   },
-  wordDisplay: {
-    width: '100%',
-    minHeight: 70,
-    backgroundColor: '#0d0d1a',
-    borderRadius: 12,
-    borderWidth: 0.5,
-    borderColor: '#1a1a2e',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    marginBottom: 12,
-  },
-  wordText: {
+  typeHint: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    fontSize: 26,
+    color: '#333',
+    fontSize: 10,
+    letterSpacing: 1,
+    textAlign: 'center',
+  },
+  textInput: {
+    backgroundColor: '#0d0d1a',
+    borderWidth: 1,
+    borderColor: '#1a1a2e',
+    borderRadius: 12,
+    padding: 16,
     color: '#00ff88',
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    fontSize: 22,
+    letterSpacing: 2,
+    minHeight: 120,
+    textAlignVertical: 'top',
+  },
+  speakBtn: {
+    backgroundColor: '#002a1a',
+    borderWidth: 1,
+    borderColor: '#00ff88',
+    borderRadius: 12,
+    paddingVertical: 18,
+    alignItems: 'center',
+  },
+  speakBtnDisabled: { opacity: 0.3 },
+  speakBtnText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
+    color: '#00ff88',
+    fontSize: 18,
     fontWeight: '700',
     letterSpacing: 3,
   },
-  actionRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 14,
-  },
-  actionBtn: {
-    backgroundColor: '#0d0d1a',
-    borderWidth: 0.5,
-    borderColor: '#1a1a2e',
-    borderRadius: 10,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  speakActionBtn: {
-    flex: 1,
-    backgroundColor: '#002a1a',
-    borderColor: '#00ff88',
-  },
-  speakActionBtnText: {
-    color: '#00ff88',
-  },
-  actionBtnDisabled: {
-    opacity: 0.3,
-  },
-  actionBtnText: {
+  clearBtn: { alignItems: 'center', paddingVertical: 10 },
+  clearBtnText: {
     fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    color: '#555',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-
-  // Keyboard
-  keyboard: {
-    gap: 6,
-  },
-  keyRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 4,
-  },
-  key: {
-    width: KEY_SIZE,
-    height: KEY_SIZE * 1.1,
-    backgroundColor: '#0d0d1a',
-    borderRadius: 6,
-    borderWidth: 0.5,
-    borderColor: '#1a1a2e',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  keySpace: {
-    width: KEY_SIZE * 6,
-    height: KEY_SIZE * 0.9,
-  },
-  keyText: {
-    fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace',
-    color: '#ccc',
-    fontSize: 13,
-    fontWeight: '600',
+    color: '#333',
+    fontSize: 12,
+    letterSpacing: 2,
   },
 });
